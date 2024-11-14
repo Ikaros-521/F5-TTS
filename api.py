@@ -11,6 +11,18 @@ from model.utils import seed_everything
 import random
 import sys
 
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+import json
+import uuid
+import os
+import uvicorn
+import traceback
+from loguru import logger
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.staticfiles import StaticFiles
+
 
 class F5TTS:
     def __init__(
@@ -116,17 +128,160 @@ class F5TTS:
 
         return wav, sr, spect
 
+COUNT = 0
+app = FastAPI()
+
+
+# Directory for uploaded files and JSON storage
+UPLOAD_DIR = "uploads"
+OUTPUT_DIR = "out"
+DATA_FILE = "ref_info.json"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        reference_data = json.load(f)
+else:
+    reference_data = {}
+
+app.mount("/out", StaticFiles(directory="out"), name="out")
+
+# 允许跨域
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class SynthesisRequest(BaseModel):
+    gen_text: str
+    ref_id: str  # Use ref_id to fetch stored audio and text
+    seed: int = -1
+    api_key: str
+
+@app.post("/tts")
+async def _tts(request: SynthesisRequest):
+    global COUNT
+
+    try:
+        if AUTH:
+            if request.api_key != API_KEY:
+                logger.warning("API Key错误")
+                return {
+                    "code": 401,
+                    "success": False,
+                    "msg": "API Key错误",
+                }
+            
+        # Retrieve reference data using ref_id
+        ref_data = reference_data.get(request.ref_id)
+        if not ref_data:
+            raise HTTPException(status_code=404, detail="Reference ID not found")
+
+        # Extract the reference audio path and text
+        ref_file_path = ref_data["ref_audio_path"]
+        ref_text = ref_data["ref_text"]
+
+        # Limit the number of iterations to 1000
+        COUNT = (COUNT + 1) % 1000
+
+        # Generate output file paths
+        wave_file = os.path.join(OUTPUT_DIR, f"out_{COUNT}.wav")
+        spect_file = os.path.join(OUTPUT_DIR, f"out_{COUNT}.png")
+
+        # Run the synthesis
+        wav, sr, spect = f5tts.infer(
+            ref_file=ref_file_path,
+            ref_text=ref_text,
+            gen_text=request.gen_text,
+            file_wave=wave_file,
+            file_spect=spect_file,
+            seed=request.seed,
+        )
+
+        if wav is None:
+            logger.error("合成失败")
+            return {
+                "code": 500,
+                "success": False,
+                "msg": "合成失败",
+            }
+        else:
+            logger.info(f"合成成功, 输出文件到: {wave_file}")
+            return {
+                "code": 0,
+                "success": True,
+                "out_audio_path": wave_file,
+                "msg": "合成成功"
+            }
+    except Exception as e:
+        logger.error(traceback.format_exc())
+        return {
+            "code": 500,
+            "success": False,
+            "msg": str(e),
+        }
+
+@app.post("/upload_ref")
+async def _upload_ref(
+    ref_file: UploadFile = File(...),
+    ref_text: str = Form(...),
+    api_key: str = Form(...),
+):
+    try:
+        if AUTH:
+            if api_key != API_KEY:
+                logger.warning("API Key错误")
+                return {
+                    "code": 401,
+                    "success": False,
+                    "msg": "API Key错误",
+                }
+
+        # Save uploaded files with a unique identifier
+        ref_id = str(uuid.uuid4())
+        ref_audio_path = os.path.join(UPLOAD_DIR, f"{ref_id}_{ref_file.filename}")
+
+        # Write file and store reference text
+        with open(ref_audio_path, "wb") as f:
+            f.write(await ref_file.read())
+
+        # Save data to JSON
+        reference_data[ref_id] = {
+            "ref_audio_path": ref_audio_path,
+            "ref_text": ref_text
+        }
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(reference_data, f)
+
+        logger.info(f"上传成功，ref_id:{ref_id}, ref_audio_path:{ref_audio_path}, ref_text:{ref_text}")
+
+        return {
+            "code": 0,
+            "success": True,
+            "ref_id": ref_id, 
+            "ref_audio_path": ref_audio_path, 
+            "ref_text": ref_text,
+            "msg": "上传成功"
+        }
+    except Exception as e:
+        logger.error(traceback.format_exc())
+        return {
+            "code": 500,
+            "success": False,
+            "msg": str(e),
+        }
 
 if __name__ == "__main__":
+    logger.add("log.txt", level="INFO", rotation="100 MB")
+
     f5tts = F5TTS()
 
-    wav, sr, spect = f5tts.infer(
-        ref_file="tests/ref_audio/test_en_1_ref_short.wav",
-        ref_text="some call me nature, others call me mother nature.",
-        gen_text="""I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring. Respect me and I'll nurture you; ignore me and you shall face the consequences.""",
-        file_wave="tests/out.wav",
-        file_spect="tests/out.png",
-        seed=-1,  # random seed = -1
-    )
+    # 是否验证api_key
+    AUTH = True
+    API_KEY = "20242024"
 
-    print("seed :", f5tts.seed)
+    uvicorn.run(app, host="0.0.0.0", port=8008)
