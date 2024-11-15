@@ -11,8 +11,8 @@ from model.utils import seed_everything
 import random
 import sys
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from pydantic import BaseModel, Field
 from typing import Optional
 import json
 import uuid
@@ -157,12 +157,21 @@ app.add_middleware(
 )
 
 class SynthesisRequest(BaseModel):
-    gen_text: str
-    ref_id: str  # Use ref_id to fetch stored audio and text
-    seed: int = -1
-    api_key: str
+    gen_text: str = Field("要合成的文本内容", description="要合成的文本内容")
+    ref_id: str = Field("参考音频的ID，从上传接口响应体中获取", description="参考音频的ID，从上传接口响应体中获取")  # Use ref_id to fetch stored audio and text
+    seed: int = Field(-1, description="随机种子，-1表示不使用随机种子")
+    api_key: str = Field("密钥", description="API Key")
 
-@app.post("/tts")
+
+class SynthesisRequest2(BaseModel):
+    gen_text: str = Field("要合成的文本内容", description="要合成的文本内容")
+    ref_audio_path: str = Field(..., description="服务器中，参考音频的相对路径")
+    ref_text: str = Field("参考音频的文本内容", description="参考文本内容")
+    seed: int = Field(-1, description="随机种子，-1表示不使用随机种子")
+    api_key: str = Field("密钥", description="API Key")
+
+
+@app.post("/tts", description="合成音频，通过上传接口返回的ref_id选定参考音频信息进行合成")
 async def _tts(request: SynthesisRequest):
     global COUNT
 
@@ -225,11 +234,75 @@ async def _tts(request: SynthesisRequest):
             "msg": str(e),
         }
 
-@app.post("/upload_ref")
+
+# 新的 tts2 接口，直接使用相对路径和参考文本
+@app.post("/tts2", description="直接使用服务器程序相对路径的参考音频和参考文本进行音频合成")
+async def _tts2(request: SynthesisRequest2):
+    global COUNT
+
+    try:
+        if AUTH:
+            if request.api_key != API_KEY:
+                logger.warning("API Key错误")
+                return {
+                    "code": 401,
+                    "success": False,
+                    "msg": "API Key错误",
+                }
+
+        # 使用传入的相对路径和文本
+        ref_file_path = request.ref_audio_path
+        ref_text = request.ref_text
+
+        # 检查参考文件是否存在
+        if not os.path.exists(ref_file_path):
+            raise HTTPException(status_code=404, detail="参考音频文件不存在")
+
+        # 限制迭代次数
+        COUNT = (COUNT + 1) % 1000
+
+        # 生成输出文件路径
+        wave_file = os.path.join(OUTPUT_DIR, f"out2_{COUNT}.wav")
+        spect_file = os.path.join(OUTPUT_DIR, f"out2_{COUNT}.png")
+
+        # 运行合成
+        wav, sr, spect = f5tts.infer(
+            ref_file=ref_file_path,
+            ref_text=ref_text,
+            gen_text=request.gen_text,
+            file_wave=wave_file,
+            file_spect=spect_file,
+            seed=request.seed,
+        )
+
+        if wav is None:
+            logger.error("合成失败")
+            return {
+                "code": 500,
+                "success": False,
+                "msg": "合成失败",
+            }
+        else:
+            logger.info(f"合成成功, 输出文件到: {wave_file}")
+            return {
+                "code": 0,
+                "success": True,
+                "out_audio_path": wave_file,
+                "msg": "合成成功"
+            }
+    except Exception as e:
+        logger.error(traceback.format_exc())
+        return {
+            "code": 500,
+            "success": False,
+            "msg": str(e),
+        }
+
+@app.post("/upload_ref", description="上传参考音频文件和参考文本到服务端")
 async def _upload_ref(
-    ref_file: UploadFile = File(...),
-    ref_text: str = Form(...),
-    api_key: str = Form(...),
+    ref_file: UploadFile = File(..., description="参考音频文件"),
+    ref_text: str = Form(..., description="参考文本"),
+    api_key: str = Form(..., description="API Key"),
 ):
     try:
         if AUTH:
@@ -284,4 +357,4 @@ if __name__ == "__main__":
     AUTH = True
     API_KEY = "20242024"
 
-    uvicorn.run(app, host="0.0.0.0", port=8008)
+    uvicorn.run(app, host="0.0.0.0", port=9000)
