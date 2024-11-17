@@ -1,15 +1,25 @@
-import soundfile as sf
-import torch
-import tqdm
-from cached_path import cached_path
-
-from model import DiT, UNetT
-from model.utils import save_spectrogram
-
-from model.utils_infer import load_vocoder, load_model, infer_process, remove_silence_for_generated_wav
-from model.utils import seed_everything
 import random
 import sys
+import tqdm
+from importlib.resources import files
+
+import soundfile as sf
+import torch
+from cached_path import cached_path
+
+from f5_tts.model import DiT, UNetT
+from f5_tts.model.utils import seed_everything
+from f5_tts.infer.utils_infer import (
+    load_vocoder,
+    load_model,
+    infer_process,
+    remove_silence_for_generated_wav,
+    save_spectrogram,
+    preprocess_ref_audio_text,
+    target_sample_rate,
+    hop_length,
+)
+
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -22,6 +32,7 @@ import traceback
 from loguru import logger
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
+
 
 
 class F5TTS:
@@ -37,10 +48,8 @@ class F5TTS:
     ):
         # Initialize parameters
         self.final_wave = None
-        self.target_sample_rate = 24000
-        self.n_mel_channels = 100
-        self.hop_length = 256
-        self.target_rms = 0.1
+        self.target_sample_rate = target_sample_rate
+        self.hop_length = hop_length
         self.seed = -1
 
         # Set device
@@ -53,7 +62,7 @@ class F5TTS:
         self.load_ema_model(model_type, ckpt_file, vocab_file, ode_method, use_ema)
 
     def load_vocoder_model(self, local_path):
-        self.vocos = load_vocoder(local_path is not None, local_path, self.device)
+        self.vocoder = load_vocoder(local_path is not None, local_path, self.device)
 
     def load_ema_model(self, model_type, ckpt_file, vocab_file, ode_method, use_ema):
         if model_type == "F5-TTS":
@@ -103,11 +112,15 @@ class F5TTS:
             seed = random.randint(0, sys.maxsize)
         seed_everything(seed)
         self.seed = seed
+
+        ref_file, ref_text = preprocess_ref_audio_text(ref_file, ref_text, device=self.device)
+
         wav, sr, spect = infer_process(
             ref_file,
             ref_text,
             gen_text,
             self.ema_model,
+            self.vocoder,
             show_info=show_info,
             progress=progress,
             target_rms=target_rms,
@@ -127,6 +140,7 @@ class F5TTS:
             self.export_spectrogram(spect, file_spect)
 
         return wav, sr, spect
+
 
 COUNT = 0
 app = FastAPI()
